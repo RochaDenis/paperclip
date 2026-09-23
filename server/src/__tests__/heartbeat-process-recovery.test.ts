@@ -10308,6 +10308,112 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("assigns open unassigned issues that block nobody back to their creator agent", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const orphanIssueId = randomUUID();
+    const freshOrphanIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "SecurityEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: orphanIssueId,
+        companyId,
+        title: "Orphan with no blocked sibling",
+        status: "blocked",
+        priority: "high",
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        updatedAt: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000),
+      },
+      {
+        id: freshOrphanIssueId,
+        companyId,
+        title: "Just created, assignment still in flight",
+        status: "todo",
+        priority: "high",
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        updatedAt: new Date(),
+      },
+    ]);
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.issueIds).toContain(orphanIssueId);
+    expect(result.issueIds).not.toContain(freshOrphanIssueId);
+
+    const orphan = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, orphanIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(orphan?.assigneeAgentId).toBe(creatorAgentId);
+
+    // The grace window is what keeps recovery from racing a caller that
+    // creates an issue and assigns it in a second write.
+    const freshOrphan = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, freshOrphanIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(freshOrphan?.assigneeAgentId).toBeNull();
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, orphanIssueId));
+    expect(comments[0]?.body).toContain("Assigned Orphan Issue");
+    expect(comments[0]?.body).toContain("no blocked sibling to pull it back");
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, orphanIssueId));
+    expect(
+      activity.map((row) => (row.details as { source?: string })?.source),
+    ).toContain("recovery.reconcile_unassigned_orphan_issue");
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(wakeups).toEqual([
+      expect.objectContaining({
+        reason: "issue_assigned",
+        payload: expect.objectContaining({ issueId: orphanIssueId }),
+      }),
+    ]);
+
+    const orphanRunId = wakeups[0]?.runId;
+    if (orphanRunId) {
+      await waitForRunToSettle(heartbeat, orphanRunId);
+    }
+  });
+
   it("re-enqueues continuation for stranded in-progress work with no active run", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedStrandedIssueFixture({

@@ -12,6 +12,7 @@ import {
   gte,
   inArray,
   isNull,
+  lt,
   not,
   notInArray,
   or,
@@ -59,7 +60,10 @@ import {
   isNativeRunnerOwnershipHeld,
   nativeRunnerOwnershipNotHeldCondition,
 } from "../native-runtime/native-runner-ownership.js";
-import { visibleIssueCondition } from "../issue-visibility.js";
+import {
+  executionIssueCondition,
+  visibleIssueCondition,
+} from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import {
@@ -165,6 +169,11 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+// An unassigned issue that blocks nobody is only adopted after it has stayed
+// untouched this long, so recovery never races a caller that creates an issue
+// and assigns it in a second write.
+const UNASSIGNED_ORPHAN_ISSUE_GRACE_MS = 15 * 60_000;
+const UNASSIGNED_ORPHAN_ISSUE_SCAN_LIMIT = 25;
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -2075,24 +2084,28 @@ export function recoveryService(
     return Boolean(budgetBlock);
   }
 
-  async function reconcileUnassignedBlockingIssues() {
-    const candidates = await db
-      .select({
-        id: issues.id,
-        companyId: issues.companyId,
-        identifier: issues.identifier,
-        status: issues.status,
-        createdByAgentId: issues.createdByAgentId,
-      })
+  async function selectUnassignedOrphanCandidates() {
+    const candidateColumns = {
+      id: issues.id,
+      companyId: issues.companyId,
+      identifier: issues.identifier,
+      status: issues.status,
+      createdByAgentId: issues.createdByAgentId,
+    };
+    const unassignedCondition = and(
+      inArray(issues.status, ["todo", "blocked"]),
+      isNull(issues.assigneeAgentId),
+      isNull(issues.assigneeUserId),
+      sql`${issues.createdByAgentId} is not null`,
+    );
+    const blockingCandidates = await db
+      .select(candidateColumns)
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
       .where(
         and(
           eq(issueRelations.type, "blocks"),
-          inArray(issues.status, ["todo", "blocked"]),
-          isNull(issues.assigneeAgentId),
-          isNull(issues.assigneeUserId),
-          sql`${issues.createdByAgentId} is not null`,
+          unassignedCondition,
           sql`exists (
             select 1
             from issues blocked_issue
@@ -2102,6 +2115,32 @@ export function recoveryService(
           )`,
         ),
       );
+
+    // An orphan that blocks nobody is invisible to the join above, so it stays
+    // unassigned forever: no heartbeat targets it and no blocked sibling drags
+    // it back into the sweep. Adopt it too, but only once it has been quiet
+    // long enough that a create-then-assign caller cannot still be mid-flight.
+    const strandedSince = new Date(
+      Date.now() - UNASSIGNED_ORPHAN_ISSUE_GRACE_MS,
+    );
+    const strandedCandidates = await db
+      .select(candidateColumns)
+      .from(issues)
+      .where(
+        and(
+          unassignedCondition,
+          executionIssueCondition(),
+          lt(issues.updatedAt, strandedSince),
+        ),
+      )
+      .orderBy(asc(issues.updatedAt))
+      .limit(UNASSIGNED_ORPHAN_ISSUE_SCAN_LIMIT);
+
+    return [...blockingCandidates, ...strandedCandidates];
+  }
+
+  async function reconcileUnassignedBlockingIssues() {
+    const candidates = await selectUnassignedOrphanCandidates();
 
     let assigned = 0;
     let skipped = 0;
@@ -2128,6 +2167,7 @@ export function recoveryService(
       }
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
+      const blocksLiveIssue = relations.blocks.length > 0;
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
       const updated = await issuesSvc.update(candidate.id, {
         assigneeAgentId: creatorAgent.id,
@@ -2140,14 +2180,24 @@ export function recoveryService(
 
       await issuesSvc.addComment(
         candidate.id,
-        [
-          "## Assigned Orphan Blocker",
-          "",
-          `Paperclip found this issue is blocking ${blockingLinks} but had no assignee, so no heartbeat could pick it up.`,
-          "",
-          "- Assigned it back to the agent that created the blocker.",
-          "- Next action: resolve this blocker or reassign it to the right owner.",
-        ].join("\n"),
+        (blocksLiveIssue
+          ? [
+              "## Assigned Orphan Blocker",
+              "",
+              `Paperclip found this issue is blocking ${blockingLinks} but had no assignee, so no heartbeat could pick it up.`,
+              "",
+              "- Assigned it back to the agent that created the blocker.",
+              "- Next action: resolve this blocker or reassign it to the right owner.",
+            ]
+          : [
+              "## Assigned Orphan Issue",
+              "",
+              "Paperclip found this issue open with no assignee and no blocked sibling to pull it back, so no heartbeat could pick it up.",
+              "",
+              "- Assigned it back to the agent that created it.",
+              "- Next action: continue the work or reassign it to the right owner.",
+            ]
+        ).join("\n"),
         {},
       );
 
@@ -2163,7 +2213,9 @@ export function recoveryService(
         details: {
           identifier: candidate.identifier,
           assigneeAgentId: creatorAgent.id,
-          source: "recovery.reconcile_unassigned_blocking_issue",
+          source: blocksLiveIssue
+            ? "recovery.reconcile_unassigned_blocking_issue"
+            : "recovery.reconcile_unassigned_orphan_issue",
         },
       });
 
