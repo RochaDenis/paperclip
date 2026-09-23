@@ -281,6 +281,9 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   });
   const wakePayloadJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake, {
     omitIssueDescription: Boolean(taskMarkdown),
+    // Prompt text, not an environment variable: no `execve(2)` per-string
+    // ceiling applies, so this copy keeps the complete continuation envelope.
+    unboundedForPrompt: true,
   });
   const sessionHandoff = nonEmpty(ctx.context.paperclipSessionHandoffMarkdown);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctx.context);

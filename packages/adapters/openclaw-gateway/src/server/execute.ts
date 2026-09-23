@@ -1110,7 +1110,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     includeExecutionContract: true,
     conversationMode: ctx.context.conversationMode === true,
   });
-  const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
+  // Prompt text, not an environment variable: no `execve(2)` per-string ceiling
+  // applies, so this copy keeps the complete continuation envelope.
+  const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake, {
+    unboundedForPrompt: true,
+  });
   const wakeText = buildWakeText(
     wakePayload,
     paperclipEnv,

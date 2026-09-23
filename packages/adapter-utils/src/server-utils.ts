@@ -1917,6 +1917,75 @@ export function normalizePaperclipWakePayload(
   };
 }
 
+// Every caller but the prompt-embedded ones hands this string to the agent
+// process as a single environment variable, and `execve(2)` caps ONE argument
+// or environment string at `MAX_ARG_STRLEN` — 32 pages, i.e. 131072 bytes on
+// Linux — independently of the 2 MiB `ARG_MAX` budget for the whole vector.
+// The payload carries the issue's full comment history through
+// `executionContinuation`, which has no size bound of its own, so a long-lived
+// issue crosses that ceiling and the agent spawn dies with `spawn E2BIG`
+// before the model ever starts. Budget the env copy so a big thread degrades
+// the payload instead of killing the run; the wake prompt still carries the
+// complete continuation envelope, and `PAPERCLIP_WAKE_PAYLOAD_JSON` has always
+// been an optional fast path the agent may fall back from to the comments API.
+// 120 KiB: the value budget under the ceiling is 131072 minus the key and the
+// NUL terminator (131043 bytes), so this keeps ~8 KiB of margin. The rest of
+// the environment does not compete for it — only the 2 MiB `ARG_MAX` total,
+// which a ~7 KiB agent environment is nowhere near.
+export const MAX_PAPERCLIP_WAKE_PAYLOAD_ENV_BYTES = 120 * 1024;
+
+function fitPaperclipWakePayloadForEnv(
+  normalized: PaperclipWakePayload,
+  maxBytes: number,
+): string | null {
+  const encode = (payload: PaperclipWakePayload) => {
+    const json = JSON.stringify(payload);
+    return Buffer.byteLength(json, "utf8") <= maxBytes ? json : null;
+  };
+  const asIs = encode(normalized);
+  if (asIs) return asIs;
+
+  const continuation = normalized.executionContinuation;
+  if (!continuation) return null;
+
+  // 1. `resumeDelta` re-sends bodies that `messages` already carries, and
+  //    `renderPaperclipWakePrompt` drops it from the prompt copy anyway. On the
+  //    measured STO-1092 failure this alone was 29345 of 135656 bytes.
+  const { resumeDelta: _resumeDelta, ...withoutResumeDelta } = continuation;
+  const withoutDelta = encode({
+    ...normalized,
+    executionContinuation: withoutResumeDelta,
+  });
+  if (withoutDelta) return withoutDelta;
+
+  // 2. Completed mutations are context, never a replay list: the operation
+  //    identity survives, the recorded result bodies do not.
+  const withoutActionResults = encode({
+    ...normalized,
+    executionContinuation: {
+      ...withoutResumeDelta,
+      completedActions: withoutResumeDelta.completedActions?.map((action) => ({
+        ...action,
+        result: null,
+      })),
+    },
+  });
+  if (withoutActionResults) return withoutActionResults;
+
+  // 3. Still over: drop the continuation envelope whole rather than ship a
+  //    trimmed `messages` under `coverage.kind: "full_task_history"`, which
+  //    would claim complete coverage over a truncated thread. What remains is
+  //    the compact fast path the skill documents — issue summary plus the
+  //    already-capped inline comment window — flagged so the agent refetches.
+  //    The wake prompt still carries the full continuation envelope.
+  return encode({
+    ...normalized,
+    executionContinuation: null,
+    truncated: true,
+    fallbackFetchNeeded: true,
+  });
+}
+
 export function stringifyPaperclipWakePayload(
   value: unknown,
   options: {
@@ -1924,21 +1993,29 @@ export function stringifyPaperclipWakePayload(
     // section already carries the issue description. Other serialized copies
     // stay complete.
     omitIssueDescription?: boolean;
+    // Prompt-embedded copies are not passed through `execve(2)` and must not be
+    // shortened by the environment budget below.
+    unboundedForPrompt?: boolean;
   } = {},
 ): string | null {
   const normalized = normalizePaperclipWakePayload(value);
   if (!normalized) return null;
-  if (options.omitIssueDescription === true && normalized.issue) {
-    return JSON.stringify({
-      ...normalized,
-      issue: {
-        ...normalized.issue,
-        description: null,
-        descriptionTruncated: false,
-      },
-    });
-  }
-  return JSON.stringify(normalized);
+  const shaped =
+    options.omitIssueDescription === true && normalized.issue
+      ? {
+          ...normalized,
+          issue: {
+            ...normalized.issue,
+            description: null,
+            descriptionTruncated: false,
+          },
+        }
+      : normalized;
+  if (options.unboundedForPrompt === true) return JSON.stringify(shaped);
+  return fitPaperclipWakePayloadForEnv(
+    shaped,
+    MAX_PAPERCLIP_WAKE_PAYLOAD_ENV_BYTES,
+  );
 }
 
 export function isPaperclipRecoveryWakePayload(value: unknown): boolean {

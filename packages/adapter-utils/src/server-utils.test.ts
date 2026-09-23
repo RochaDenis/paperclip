@@ -20,6 +20,7 @@ import {
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
+  MAX_PAPERCLIP_WAKE_PAYLOAD_ENV_BYTES,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
@@ -3833,4 +3834,197 @@ describe("runtime skill assignment boundaries", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+});
+
+describe("wake payload environment budget", () => {
+  const buildContinuation = (
+    messageCount: number,
+    bodyBytes: number,
+  ): Record<string, unknown> => ({
+    version: 1,
+    companyId: "company-1",
+    issueId: "issue-1",
+    trigger: {
+      reason: "issue_commented",
+      interactionId: null,
+      sourceRunId: "run-0",
+    },
+    originCommentIds: [],
+    objective: "Keep the corrective front moving.",
+    messages: Array.from({ length: messageCount }, (_, index) => ({
+      id: `comment-${index}`,
+      authorType: "agent",
+      authorId: "agent-1",
+      body: "m".repeat(bodyBytes),
+      createdAt: "2026-09-23T07:58:00.000Z",
+      updatedAt: "2026-09-23T07:58:00.000Z",
+      deleted: false,
+      sourceTrust: null,
+    })),
+    interactionOutcomes: [],
+    completedWork: "Continuation summary.",
+    unresolvedInteractionIds: [],
+    coverage: {
+      kind: "full_task_history",
+      throughCommentId: `comment-${messageCount - 1}`,
+      summaryThroughCommentId: null,
+    },
+  });
+
+  const buildPayload = (
+    continuation: Record<string, unknown> | null,
+  ): Record<string, unknown> => ({
+    reason: "issue_commented",
+    issue: {
+      id: "issue-1",
+      identifier: "PAP-1092",
+      title: "Corrective slice",
+      status: "in_progress",
+      workMode: "standard",
+    },
+    commentIds: ["comment-0"],
+    latestCommentId: "comment-0",
+    commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+    comments: [
+      {
+        id: "comment-0",
+        body: "Latest board comment.",
+        author: { type: "user", id: "board-user-1" },
+        createdAt: "2026-09-23T07:58:00.000Z",
+      },
+    ],
+    executionContinuation: continuation,
+    fallbackFetchNeeded: false,
+  });
+
+  it("emits a payload inside the budget byte-identical to an unbudgeted encode", () => {
+    const payload = buildPayload(buildContinuation(4, 64));
+    const serialized = stringifyPaperclipWakePayload(payload);
+    expect(serialized).toBe(
+      stringifyPaperclipWakePayload(payload, { unboundedForPrompt: true }),
+    );
+    expect(JSON.parse(serialized ?? "{}")).toMatchObject({
+      executionContinuation: { coverage: { kind: "full_task_history" } },
+    });
+  });
+
+  it("drops the duplicated resumeDelta first and keeps every message", () => {
+    const continuation = buildContinuation(24, 4_000);
+    const payload = buildPayload({
+      ...continuation,
+      resumeDelta: {
+        baseRunId: "run-0",
+        messages: (continuation.messages as unknown[]).slice(0, 8),
+      },
+    });
+    expect(
+      Buffer.byteLength(
+        stringifyPaperclipWakePayload(payload, { unboundedForPrompt: true }) ??
+          "",
+        "utf8",
+      ),
+    ).toBeGreaterThan(MAX_PAPERCLIP_WAKE_PAYLOAD_ENV_BYTES);
+
+    const serialized = stringifyPaperclipWakePayload(payload) ?? "";
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(
+      MAX_PAPERCLIP_WAKE_PAYLOAD_ENV_BYTES,
+    );
+    const parsed = JSON.parse(serialized);
+    expect(parsed.executionContinuation.resumeDelta).toBeUndefined();
+    expect(parsed.executionContinuation.messages).toHaveLength(24);
+    expect(parsed.executionContinuation.coverage.kind).toBe(
+      "full_task_history",
+    );
+    expect(parsed.fallbackFetchNeeded).toBe(false);
+  });
+
+  it("clears completed action results before giving up the envelope", () => {
+    const continuation = buildContinuation(24, 4_000);
+    const payload = buildPayload({
+      ...continuation,
+      completedActions: [
+        {
+          runId: "run-0",
+          receiptId: "receipt-0",
+          operationId: "operation-0",
+          result: { body: "r".repeat(24_000) },
+        },
+      ],
+    });
+
+    const parsed = JSON.parse(stringifyPaperclipWakePayload(payload) ?? "{}");
+    expect(parsed.executionContinuation).not.toBeNull();
+    expect(parsed.executionContinuation.messages).toHaveLength(24);
+    expect(parsed.executionContinuation.completedActions).toEqual([
+      {
+        runId: "run-0",
+        receiptId: "receipt-0",
+        operationId: "operation-0",
+        result: null,
+      },
+    ]);
+  });
+
+  it("drops the whole envelope rather than shipping a trimmed thread as full coverage", () => {
+    const payload = buildPayload(buildContinuation(96, 2_000));
+
+    const serialized = stringifyPaperclipWakePayload(payload) ?? "";
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(
+      MAX_PAPERCLIP_WAKE_PAYLOAD_ENV_BYTES,
+    );
+    const parsed = JSON.parse(serialized);
+    expect(parsed.executionContinuation).toBeNull();
+    expect(parsed.fallbackFetchNeeded).toBe(true);
+    expect(parsed.truncated).toBe(true);
+    expect(parsed.issue.identifier).toBe("PAP-1092");
+    expect(serialized).not.toContain("full_task_history");
+  });
+
+  it("leaves the prompt-embedded copy unbudgeted", () => {
+    const payload = buildPayload(buildContinuation(96, 2_000));
+    const promptCopy =
+      stringifyPaperclipWakePayload(payload, { unboundedForPrompt: true }) ?? "";
+    expect(Buffer.byteLength(promptCopy, "utf8")).toBeGreaterThan(
+      MAX_PAPERCLIP_WAKE_PAYLOAD_ENV_BYTES,
+    );
+    expect(JSON.parse(promptCopy).executionContinuation.messages).toHaveLength(
+      96,
+    );
+  });
+
+  it.runIf(process.platform === "linux")(
+    "spawns a child with the budgeted payload on a thread that fails unbudgeted",
+    async () => {
+      const payload = buildPayload(buildContinuation(96, 2_000));
+      // An oversized environment string is refused by `execve(2)` itself, so
+      // Node surfaces it as a synchronous throw from `spawn` on some releases
+      // and as an `error` event on others; both are the same refusal.
+      const spawnWith = (value: string) =>
+        new Promise<string>((resolve) => {
+          try {
+            const child = spawn(process.execPath, ["-e", "process.exit(0)"], {
+              env: { ...process.env, PAPERCLIP_WAKE_PAYLOAD_JSON: value },
+              stdio: "ignore",
+            });
+            child.on("error", (error: NodeJS.ErrnoException) =>
+              resolve(error.code ?? "error"),
+            );
+            child.on("exit", () => resolve("spawned"));
+          } catch (error) {
+            resolve((error as NodeJS.ErrnoException).code ?? "error");
+          }
+        });
+
+      expect(
+        await spawnWith(
+          stringifyPaperclipWakePayload(payload, {
+            unboundedForPrompt: true,
+          }) ?? "",
+        ),
+      ).toBe("E2BIG");
+      expect(
+        await spawnWith(stringifyPaperclipWakePayload(payload) ?? ""),
+      ).toBe("spawned");
+    },
+  );
 });
