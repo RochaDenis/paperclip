@@ -5,6 +5,7 @@ import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { queryKeys } from "../lib/queryKeys";
 import { NewIssueDialog } from "./NewIssueDialog";
 
 const dialogState = vi.hoisted(() => ({
@@ -297,13 +298,14 @@ async function waitForAssertion(assertion: () => void, attempts = 20) {
   throw lastError;
 }
 
-function renderDialog(container: HTMLDivElement) {
+function renderDialog(container: HTMLDivElement, hiddenSettings: string[] = []) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
       mutations: { retry: false },
     },
   });
+  queryClient.setQueryData(queryKeys.health, { hiddenSettings });
   const root = createRoot(container);
   act(() => {
     root.render(
@@ -710,6 +712,31 @@ describe("NewIssueDialog", () => {
       }),
     );
 
+    act(() => root.unmount());
+  });
+
+  it("hides isolation choices and omits stale workspace draft overrides", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: true });
+    mockProjectsApi.list.mockResolvedValue([{
+      id: "project-1", name: "Alpha", workspaces: [],
+      executionWorkspacePolicy: { enabled: true, defaultMode: "isolated_workspace" },
+    }]);
+    dialogState.newIssueDefaults = {
+      projectId: "project-1", executionWorkspaceId: "stale-workspace",
+      executionWorkspaceMode: "reuse_existing",
+    };
+    const { root } = renderDialog(container, ["workspaces.isolation"]);
+    await flush();
+    expect(container.textContent).not.toContain("Execution workspace");
+    expect(container.querySelector('option[value="isolated_workspace"]')).toBeNull();
+    await typeTextareaValue(container.querySelector('textarea[placeholder="Task title"]')!, "Managed task");
+    const create = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Create Task"));
+    act(() => create!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
+    const payload = mockIssuesApi.create.mock.calls[0][1];
+    expect(payload).not.toHaveProperty("executionWorkspacePreference");
+    expect(payload).not.toHaveProperty("executionWorkspaceSettings");
+    expect(payload).not.toHaveProperty("executionWorkspaceId");
     act(() => root.unmount());
   });
 
