@@ -1048,6 +1048,12 @@ export function NewIssueDialog() {
     const executionWorkspaceSettings = executionWorkspacePolicy?.enabled
       ? { mode: requestedExecutionWorkspaceMode }
       : null;
+    // A task launched from a workspace (or its parent task) keeps that explicit
+    // context. Draft-only choices are ignored while the selector is hidden.
+    const contextualWorkspaceId = !workspaceIsolationControlsVisible
+      && newIssueDefaults.projectId === projectId
+      ? newIssueDefaults.executionWorkspaceId
+      : undefined;
     const executionPolicy = buildExecutionPolicy({
       reviewerValues: reviewerValue ? [reviewerValue] : [],
       approverValues: approverValue ? [approverValue] : [],
@@ -1072,6 +1078,7 @@ export function NewIssueDialog() {
         ? { executionWorkspaceId: selectedExecutionWorkspaceId }
         : {}),
       ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
+      ...(contextualWorkspaceId ? { executionWorkspaceId: contextualWorkspaceId, executionWorkspacePreference: "reuse_existing" } : {}),
       ...(executionPolicy ? { executionPolicy } : {}),
       ...(watchdogAgentId
         ? { watchdog: { agentId: watchdogAgentId, instructions: watchdogInstructions.trim() || null } }

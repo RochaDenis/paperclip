@@ -120,7 +120,8 @@ Daytona snapshot for future leases.
   links). Workspace navigation, files, status, and runtime access stay available.
   This key only controls UI visibility: it does not disable isolation, change
   saved policies, or block APIs used by agents. New tasks and routine runs omit
-  hidden overrides so the server applies the existing defaults. Hide the two
+  hidden draft overrides so the server applies the existing defaults. Tasks
+  launched from a workspace or parent task keep that explicit context. Hide the two
   experimental isolation toggles separately when the operator manages them.
 
 Unknown keys are logged and ignored, so one list can be rolled across a fleet

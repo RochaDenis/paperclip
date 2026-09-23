@@ -721,10 +721,12 @@ describe("NewIssueDialog", () => {
       id: "project-1", name: "Alpha", workspaces: [],
       executionWorkspacePolicy: { enabled: true, defaultMode: "isolated_workspace" },
     }]);
-    dialogState.newIssueDefaults = {
-      projectId: "project-1", executionWorkspaceId: "stale-workspace",
-      executionWorkspaceMode: "reuse_existing",
-    };
+    localStorage.setItem("paperclip:issue-draft", JSON.stringify({
+      title: "Draft task", description: "", status: "todo", priority: "medium", assigneeValue: "",
+      reviewerValue: "", approverValue: "", projectId: "project-1",
+      selectedExecutionWorkspaceId: "stale-workspace", executionWorkspaceMode: "reuse_existing",
+      assigneeModelOverride: "", assigneeThinkingEffort: "", assigneeChrome: false, workMode: "standard",
+    }));
     const { root } = renderDialog(container, ["workspaces.isolation"]);
     await flush();
     expect(container.textContent).not.toContain("Execution workspace");
@@ -737,6 +739,25 @@ describe("NewIssueDialog", () => {
     expect(payload).not.toHaveProperty("executionWorkspacePreference");
     expect(payload).not.toHaveProperty("executionWorkspaceSettings");
     expect(payload).not.toHaveProperty("executionWorkspaceId");
+    act(() => root.unmount());
+  });
+
+  it.each([false, true])("keeps explicit workspace launch context when isolation controls are hidden (subtask: %s)", async (subtask) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: true });
+    dialogState.newIssueDefaults = {
+      projectId: "project-1", executionWorkspaceId: "workspace-context",
+      ...(subtask ? { parentId: "parent-task", parentIdentifier: "TEST-1" } : {}),
+    };
+    const { root } = renderDialog(container, ["workspaces.isolation"]);
+    await flush();
+    expect(container.querySelector('option[value="isolated_workspace"]')).toBeNull();
+    await typeTextareaValue(container.querySelector('textarea[placeholder="Task title"]')!, "Context task");
+    const create = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes(subtask ? "Create Sub-Task" : "Create Task"));
+    act(() => create!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
+    expect(mockIssuesApi.create.mock.calls[0][1]).toMatchObject({
+      executionWorkspaceId: "workspace-context", executionWorkspacePreference: "reuse_existing",
+    });
     act(() => root.unmount());
   });
 
