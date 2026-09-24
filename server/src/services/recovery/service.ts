@@ -109,7 +109,10 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
-import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import {
+  DIRECT_NON_INVOKABLE_STATUSES,
+  evaluateAgentInvokabilityFromDb,
+} from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -173,7 +176,13 @@ const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 // untouched this long, so recovery never races a caller that creates an issue
 // and assigns it in a second write.
 const UNASSIGNED_ORPHAN_ISSUE_GRACE_MS = 15 * 60_000;
-const UNASSIGNED_ORPHAN_ISSUE_SCAN_LIMIT = 25;
+// The scan window is wider than the adoption budget on purpose: reading past a
+// candidate is one row of a cheap indexed scan, while adopting one costs a
+// lock, a comment, an activity row, and a wakeup. Keeping the two apart means
+// candidates that turn out to be unadoptable are stepped over inside a single
+// sweep instead of holding the head of the oldest-first queue across sweeps.
+const UNASSIGNED_ORPHAN_ISSUE_SCAN_LIMIT = 200;
+const UNASSIGNED_ORPHAN_ISSUE_ADOPT_LIMIT = 25;
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -2084,6 +2093,28 @@ export function recoveryService(
     return Boolean(budgetBlock);
   }
 
+  // A creator that no longer exists, moved company, or sits in a directly
+  // non-invokable status disqualifies its orphan on this pass and on every
+  // future one. Leaving those rows in the oldest-first scan window would let a
+  // handful of permanently unadoptable issues hold the head of the queue
+  // forever and starve every recoverable orphan behind them, so they never
+  // become candidates in the first place. The status list is derived from
+  // `DIRECT_NON_INVOKABLE_STATUSES` so this predicate cannot drift away from
+  // the invokability check that runs per candidate.
+  function adoptableCreatorCondition() {
+    const blockedStatuses = [...DIRECT_NON_INVOKABLE_STATUSES];
+    return sql`exists (
+      select 1
+      from ${agents} creator
+      where creator.id = ${issues.createdByAgentId}
+        and creator.company_id = ${issues.companyId}
+        and creator.status not in (${sql.join(
+          blockedStatuses.map((status) => sql`${status}`),
+          sql`, `,
+        )})
+    )`;
+  }
+
   async function selectUnassignedOrphanCandidates() {
     const candidateColumns = {
       id: issues.id,
@@ -2131,25 +2162,49 @@ export function recoveryService(
           unassignedCondition,
           executionIssueCondition(),
           lt(issues.updatedAt, strandedSince),
+          adoptableCreatorCondition(),
         ),
       )
       .orderBy(asc(issues.updatedAt))
       .limit(UNASSIGNED_ORPHAN_ISSUE_SCAN_LIMIT);
 
-    return [...blockingCandidates, ...strandedCandidates];
+    return { blockingCandidates, strandedCandidates };
   }
 
   async function reconcileUnassignedBlockingIssues() {
-    const candidates = await selectUnassignedOrphanCandidates();
+    const { blockingCandidates, strandedCandidates } =
+      await selectUnassignedOrphanCandidates();
+    const candidates = [
+      ...blockingCandidates.map((candidate) => ({
+        ...candidate,
+        stranded: false,
+      })),
+      ...strandedCandidates.map((candidate) => ({
+        ...candidate,
+        stranded: true,
+      })),
+    ];
 
     let assigned = 0;
     let skipped = 0;
+    let strandedAdopted = 0;
     const issueIds: string[] = [];
     const seen = new Set<string>();
 
     for (const candidate of candidates) {
       if (seen.has(candidate.id)) continue;
       seen.add(candidate.id);
+
+      // The stranded scan window is deliberately wider than the work this
+      // sweep will do, so the remaining per-candidate skips (an invalid
+      // reporting chain, a lost race) are read past cheaply instead of
+      // consuming the whole budget and pinning the queue head.
+      if (
+        candidate.stranded &&
+        strandedAdopted >= UNASSIGNED_ORPHAN_ISSUE_ADOPT_LIMIT
+      ) {
+        continue;
+      }
 
       const creatorAgentId = candidate.createdByAgentId;
       if (!creatorAgentId) {
@@ -2169,14 +2224,22 @@ export function recoveryService(
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blocksLiveIssue = relations.blocks.length > 0;
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
+      // Adoption must lose every race it enters. The candidate was read as
+      // unowned some awaits ago; if the board or another agent has assigned
+      // it since, that decision wins and this sweep writes nothing, so the
+      // comment, the activity row, and the creator wakeup below only ever
+      // describe an adoption that actually happened.
       const updated = await issuesSvc.update(candidate.id, {
         assigneeAgentId: creatorAgent.id,
         assigneeUserId: null,
+        companyGuard: candidate.companyId,
+        unassignedGuard: true,
       });
       if (!updated) {
         skipped += 1;
         continue;
       }
+      if (candidate.stranded) strandedAdopted += 1;
 
       await issuesSvc.addComment(
         candidate.id,

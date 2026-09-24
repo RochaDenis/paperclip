@@ -6600,10 +6600,14 @@ export function issueRoutes(
     // An orphan has no assignee by definition, so reading ownership only from
     // the persisted row would make the request that hands the issue an owner
     // fail for not having one yet. The incoming assignee counts only while the
-    // row is still unowned: a request that moves the issue away from a live
-    // owner keeps answering to that owner.
+    // row is unowned by *anyone*: a human assignee owns the issue just as much
+    // as an agent does, so an issue parked on a person keeps answering to the
+    // persisted row and an agent cannot name itself past this gate.
+    const persistedOwnerless =
+      !issue.assigneeAgentId && !issue.assigneeUserId;
     const effectiveAssigneeAgentId =
-      issue.assigneeAgentId ?? options.incomingAssigneeAgentId ?? null;
+      issue.assigneeAgentId ??
+      (persistedOwnerless ? (options.incomingAssigneeAgentId ?? null) : null);
     if (!effectiveAssigneeAgentId) {
       res.status(409).json({
         error: "Issue follow-up requires an assigned agent",

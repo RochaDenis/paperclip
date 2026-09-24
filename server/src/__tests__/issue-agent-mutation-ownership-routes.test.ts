@@ -1723,6 +1723,31 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 
+  // A human assignee owns the issue just as much as an agent does. Reading the
+  // orphan exception off `assigneeAgentId` alone would let an agent name itself
+  // on work parked on a person and walk through the resume gate, which is the
+  // exact shape of every board-owned issue waiting on a human click.
+  it("refuses an agent that names itself on an issue owned by a human", async () => {
+    const boardOwned = makeIssue({
+      status: "blocked",
+      assigneeAgentId: null,
+      assigneeUserId: "board-user",
+    });
+    mockIssueService.getById.mockResolvedValue(boardOwned);
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(peerAgentId),
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", assigneeAgentId: peerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue follow-up requires an assigned agent");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("still refuses an orphan status follow-up that hands the issue no owner", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: null }),
