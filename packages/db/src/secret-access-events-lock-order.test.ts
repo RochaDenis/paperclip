@@ -61,38 +61,73 @@ function insertAuditEvent(sql: postgres.Sql | postgres.TransactionSql, ids: Fixt
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// A named session lets the test observe, through `pg_stat_activity`, the exact
+// moment a transaction holds the locks it needs and is waiting on the next
+// step. That replaces fixed sleeps, which assume a scheduler timing that CI
+// does not guarantee: a slow holder must not make the append run before the
+// operational rows are locked.
+async function nameSession(sql: postgres.Sql, applicationName: string): Promise<void> {
+  await sql`SELECT set_config('application_name', ${applicationName}, false)`;
+}
+
+async function waitUntilHolding(
+  observer: postgres.Sql,
+  applicationName: string,
+  querySubstring: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const rows = await observer<{ state: string | null; query: string | null }[]>`
+      SELECT state, query
+      FROM pg_stat_activity
+      WHERE application_name = ${applicationName}`;
+    const row = rows[0];
+    if (row?.state === "idle in transaction" && (row.query ?? "").includes(querySubstring)) {
+      return;
+    }
+    await sleep(25);
+  }
+  throw new Error(
+    `session ${applicationName} never reached idle-in-transaction on "${querySubstring}"`,
+  );
+}
+
 describeDatabase("secret_access_events lock order", () => {
   it(
     "appends the audit row while another transaction holds the issue and run rows",
     async () => {
       const database = await startEmbeddedPostgresTestDatabase("paperclip-secret-access-lock-");
+      const holderName = `sto-lock-holder-${randomUUID()}`;
       const holder = postgres(database.connectionString, { max: 1, onnotice: () => {} });
       const writer = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+      let release: () => void = () => {};
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let held: Promise<unknown> | undefined;
       try {
+        await nameSession(holder, holderName);
         const ids = await seed(holder);
 
         // The execution-lock reconciler holds both rows for the length of its
         // transaction. An audit append that waits on either of them is what
         // makes the deadlock possible in the first place.
-        let release!: () => void;
-        const released = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        const held = holder.begin(async (tx) => {
+        held = holder.begin(async (tx) => {
           await tx`SELECT id FROM issues WHERE id = ${ids.issue} FOR UPDATE`;
           await tx`SELECT id FROM heartbeat_runs WHERE id = ${ids.run} FOR UPDATE`;
           await released;
         });
 
-        await sleep(250);
+        // Only append once the holder really owns both row locks.
+        await waitUntilHolding(writer, holderName, "heartbeat_runs");
         // A short statement timeout turns "blocked on an operational row" into
         // a fast, legible failure instead of a hang.
         await writer`SET statement_timeout = 3000`;
         await expect(insertAuditEvent(writer, ids)).resolves.toBeDefined();
-
-        release();
-        await held;
       } finally {
+        // Release and settle the holder before closing, so a failed assertion
+        // cannot leave it blocked and hide the failure behind a test timeout.
+        release();
+        if (held) await held.catch(() => {});
         await holder.end();
         await writer.end();
         await database.cleanup();
@@ -105,42 +140,67 @@ describeDatabase("secret_access_events lock order", () => {
     "does not deadlock when the audit append reaches the two rows in inverted order",
     async () => {
       const database = await startEmbeddedPostgresTestDatabase("paperclip-secret-access-deadlock-");
+      const reconcilerName = `sto-lock-reconciler-${randomUUID()}`;
+      const auditorName = `sto-lock-auditor-${randomUUID()}`;
       const setup = postgres(database.connectionString, { max: 1, onnotice: () => {} });
       const reconciler = postgres(database.connectionString, { max: 1, onnotice: () => {} });
       const auditor = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+      let releaseCanonical: () => void = () => {};
+      const canonicalReady = new Promise<void>((resolve) => {
+        releaseCanonical = resolve;
+      });
+      let releaseAuditor: () => void = () => {};
+      const auditorReady = new Promise<void>((resolve) => {
+        releaseAuditor = resolve;
+      });
+      let transactionA: Promise<string> | undefined;
+      let transactionB: Promise<string> | undefined;
       try {
         const ids = await seed(setup);
+        await nameSession(reconciler, reconcilerName);
+        await nameSession(auditor, auditorName);
 
         // Transaction A is the canonical order used across issues.ts:
-        // issues first, then heartbeat_runs.
-        const transactionA = reconciler
+        // issues first, then heartbeat_runs. It pauses while holding the issue.
+        transactionA = reconciler
           .begin(async (tx) => {
             await tx`SELECT id FROM issues WHERE id = ${ids.issue} FOR UPDATE`;
-            await sleep(1500);
+            await canonicalReady;
             await tx`SELECT id FROM heartbeat_runs WHERE id = ${ids.run} FOR UPDATE`;
           })
           .then(() => "committed" as const)
           .catch((error: Error) => `failed: ${error.message}`);
 
-        await sleep(300);
+        await waitUntilHolding(setup, reconcilerName, "FROM issues");
 
-        // Transaction B reaches the same two rows in the inverted order: the
-        // run row first, then whatever the audit INSERT itself needs. This is
-        // the production interleaving, made deterministic — it no longer
-        // depends on which RI trigger name happens to sort first.
-        const transactionB = auditor
+        // Transaction B reaches the same two rows in the inverted order: it
+        // takes the run row first and pauses, so A can ask for the run row while
+        // B still holds it.
+        transactionB = auditor
           .begin(async (tx) => {
             await tx`SELECT id FROM heartbeat_runs WHERE id = ${ids.run} FOR KEY SHARE`;
+            await auditorReady;
             await insertAuditEvent(tx, ids);
           })
           .then(() => "committed" as const)
           .catch((error: Error) => `failed: ${error.message}`);
+
+        await waitUntilHolding(setup, auditorName, "heartbeat_runs");
+
+        // A now asks for the run row that B holds, and B asks for the issue row
+        // that A holds: the production cycle, with no timing assumption.
+        releaseCanonical();
+        releaseAuditor();
 
         expect(await Promise.all([transactionA, transactionB])).toEqual([
           "committed",
           "committed",
         ]);
       } finally {
+        releaseCanonical();
+        releaseAuditor();
+        if (transactionA) await transactionA.catch(() => {});
+        if (transactionB) await transactionB.catch(() => {});
         await setup.end();
         await reconciler.end();
         await auditor.end();
