@@ -156,12 +156,15 @@ describeEmbeddedPostgres("issue checkout lock order", () => {
       });
       await runRowIsHeld;
 
-      const checkout = issueService(db).assertCheckoutOwner(issueId, agentId, runId);
-      const checkoutSettled = checkout.then(
-        () => undefined,
-        () => undefined,
-      );
+      let checkoutSettled: Promise<void> = Promise.resolve();
       try {
+        // Keep the service construction inside the protected block: `issueService`
+        // can throw synchronously, and the finally must still release the pin.
+        const checkout = issueService(db).assertCheckoutOwner(issueId, agentId, runId);
+        checkoutSettled = checkout.then(
+          () => undefined,
+          () => undefined,
+        );
         // Once a session is blocked by the pin, the adoption transaction has
         // reached — and parked on — the run row. No fixed sleep assumes it.
         await waitUntilBlockedBy(pinnerPid);
@@ -245,16 +248,17 @@ describeEmbeddedPostgres("issue checkout lock order", () => {
       });
       await runRowIsHeld;
 
-      const checkout = issueService(db)
-        .assertCheckoutOwner(issueId, agentId, runId)
-        .then((ownership) => ownership.checkoutRunId)
-        .catch((error: Error) => `failed: ${error.message}`);
-      const checkoutSettled = checkout.then(
-        () => undefined,
-        () => undefined,
-      );
+      let checkoutSettled: Promise<void> = Promise.resolve();
       let peerSettled: Promise<void> = Promise.resolve();
       try {
+        const checkout = issueService(db)
+          .assertCheckoutOwner(issueId, agentId, runId)
+          .then((ownership) => ownership.checkoutRunId)
+          .catch((error: Error) => `failed: ${error.message}`);
+        checkoutSettled = checkout.then(
+          () => undefined,
+          () => undefined,
+        );
         await waitUntilBlockedBy(pinnerPid);
 
         let peerPid = 0;
