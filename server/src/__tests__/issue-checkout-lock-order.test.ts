@@ -156,8 +156,12 @@ describeEmbeddedPostgres("issue checkout lock order", () => {
       });
       await runRowIsHeld;
 
+      const checkout = issueService(db).assertCheckoutOwner(issueId, agentId, runId);
+      const checkoutSettled = checkout.then(
+        () => undefined,
+        () => undefined,
+      );
       try {
-        const checkout = issueService(db).assertCheckoutOwner(issueId, agentId, runId);
         // Once a session is blocked by the pin, the adoption transaction has
         // reached — and parked on — the run row. No fixed sleep assumes it.
         await waitUntilBlockedBy(pinnerPid);
@@ -193,6 +197,9 @@ describeEmbeddedPostgres("issue checkout lock order", () => {
         expect(stored).toEqual({ checkoutRunId: runId, executionRunId: runId });
       } finally {
         releaseRunRow();
+        // Settle every started operation before the pools close, so a wait that
+        // times out cannot leave a transaction racing `afterEach`.
+        await Promise.allSettled([holding, checkoutSettled]);
         await holding.catch(() => {});
       }
     },
@@ -238,11 +245,16 @@ describeEmbeddedPostgres("issue checkout lock order", () => {
       });
       await runRowIsHeld;
 
+      const checkout = issueService(db)
+        .assertCheckoutOwner(issueId, agentId, runId)
+        .then((ownership) => ownership.checkoutRunId)
+        .catch((error: Error) => `failed: ${error.message}`);
+      const checkoutSettled = checkout.then(
+        () => undefined,
+        () => undefined,
+      );
+      let peerSettled: Promise<void> = Promise.resolve();
       try {
-        const checkout = issueService(db)
-          .assertCheckoutOwner(issueId, agentId, runId)
-          .then((ownership) => ownership.checkoutRunId)
-          .catch((error: Error) => `failed: ${error.message}`);
         await waitUntilBlockedBy(pinnerPid);
 
         let peerPid = 0;
@@ -261,6 +273,10 @@ describeEmbeddedPostgres("issue checkout lock order", () => {
           })
           .then(() => "committed" as const)
           .catch((error: Error) => `failed: ${error.message}`);
+        peerSettled = peer.then(
+          () => undefined,
+          () => undefined,
+        );
         // The peer has reached its blocking point once it is waiting on a lock:
         // `issues`, held by adoption, or the pinned run row.
         await waitUntilBlocked(() => peerPid);
@@ -274,6 +290,9 @@ describeEmbeddedPostgres("issue checkout lock order", () => {
         ]);
       } finally {
         releaseRunRow();
+        // Settle the peer and the adoption before the pools close, so a wait
+        // that times out cannot leave a transaction racing `afterEach`.
+        await Promise.allSettled([pinning, checkoutSettled, peerSettled]);
         await pinning.catch(() => {});
       }
     },
