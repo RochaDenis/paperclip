@@ -133,13 +133,31 @@ describe("FileViewerSheet copy actions", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
+  // The confirmation toast re-renders on a microtask/timer tick after the
+  // click handler runs; a single `await` after `click()` is not always
+  // enough for it to land in the DOM. Poll instead of asserting once.
+  async function waitForToast(text: string, attempts = 20) {
+    let lastError: unknown;
+    for (let index = 0; index < attempts; index += 1) {
+      if (document.body.textContent?.includes(text)) return;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!document.body.textContent?.includes(text)) {
+      throw lastError ?? new Error(`Expected toast text "${text}" not found`);
+    }
+  }
+
   it("copies file contents and shows confirmation", async () => {
     renderSheet();
 
     await click("Copy file contents");
 
     expect(writeText).toHaveBeenCalledWith("hello from the file");
-    expect(document.body.textContent).toContain("Copied contents");
+    await waitForToast("Copied contents");
   });
 
   it("copies the current file view link and shows confirmation", async () => {
@@ -148,7 +166,7 @@ describe("FileViewerSheet copy actions", () => {
     await click("Copy link to this file view");
 
     expect(writeText).toHaveBeenCalledWith(window.location.href);
-    expect(document.body.textContent).toContain("Copied link");
+    await waitForToast("Copied link");
   });
 
   it("renders a keyboard-addressable file tree resize separator", () => {
