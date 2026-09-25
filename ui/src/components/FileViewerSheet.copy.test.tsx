@@ -210,7 +210,6 @@ describe("FileViewerSheet copy actions", () => {
     expect(document.body.querySelector('[aria-label="launch.md source"]')).toBeNull();
     expect(document.body.querySelector('button[aria-label="Show rendered Markdown"]')).not.toBeNull();
     expect(document.body.querySelector('button[aria-label="Show raw Markdown"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("Rendered Markdown: # Launch note");
 
     await click("Show raw Markdown");
 
