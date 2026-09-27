@@ -25,6 +25,7 @@ import {
   eq,
   inArray,
   isNull,
+  ne,
   notInArray,
   sql,
 } from "drizzle-orm";
@@ -6094,6 +6095,7 @@ export function issueRoutes(
             "blocked",
           ]),
           isNull(issueRows.hiddenAt),
+          ne(issueRows.originKind, TASK_WATCHDOG_ORIGIN_KIND),
         ),
       )
       .orderBy(
@@ -6110,6 +6112,7 @@ export function issueRoutes(
     currentChildIssueId: string | null | undefined;
   }) {
     if (!input.watchdogParentIssueId || !input.currentChildIssueId) return;
+    if (input.watchdogParentIssueId === input.currentChildIssueId) return;
     const watchdogParent = await svc.getById(input.watchdogParentIssueId);
     if (
       !watchdogParent ||
