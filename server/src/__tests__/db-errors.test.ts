@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isUniqueViolation } from "../db-errors.js";
+import { acceptanceGuardMessage, isUniqueViolation } from "../db-errors.js";
 
 const CONSTRAINT = "issues_open_routine_execution_uq";
 
@@ -47,5 +47,26 @@ describe("isUniqueViolation", () => {
     const looped: { cause?: unknown } = {};
     looped.cause = looped;
     expect(isUniqueViolation(looped, CONSTRAINT)).toBe(false);
+  });
+});
+
+describe("acceptanceGuardMessage", () => {
+  const MESSAGE = "Tarefa STO-1906 mexe no que o usuario ve: precisa do PASSA do Testador de Aceite com print antes de concluir. Mande para o roteiro da frente (STO-1654 Corretiva, STO-1658 Cronograma).";
+
+  it("recovers the message from a Drizzle-wrapped PostgresError", () => {
+    const wrapped = new Error("Failed query: update \"issues\" set \"status\" = $1");
+    (wrapped as { cause?: unknown }).cause = { code: "P0001", message: MESSAGE };
+    expect(acceptanceGuardMessage(wrapped)).toBe(MESSAGE);
+  });
+
+  it("recovers the message from a bare PostgresError", () => {
+    expect(acceptanceGuardMessage({ code: "P0001", message: MESSAGE })).toBe(MESSAGE);
+  });
+
+  it("returns null for unrelated errors", () => {
+    expect(acceptanceGuardMessage(new Error("boom"))).toBeNull();
+    expect(acceptanceGuardMessage({ code: "23503", message: "foreign key violation" })).toBeNull();
+    expect(acceptanceGuardMessage(null)).toBeNull();
+    expect(acceptanceGuardMessage(undefined)).toBeNull();
   });
 });

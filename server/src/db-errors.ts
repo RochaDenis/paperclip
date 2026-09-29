@@ -50,3 +50,29 @@ export function isForeignKeyViolation(error: unknown): boolean {
   }
   return false;
 }
+
+const ACCEPTANCE_GUARD_MARKER = "mexe no que o usuario ve";
+
+/**
+ * Recovers the message raised by the `aceite_guard` BEFORE UPDATE trigger on
+ * `issues`. The trigger blocks `status = 'done'` on user-visible work (title
+ * matching CORRETIVA/CRONOGRAMA/TELA/BUG/HOTFIX/APP/MOTOR/PRODUTO/IMPORTA)
+ * that has no "PASSA" comment from the Testador de Aceite (or a manual ACEITE
+ * by a user). It raises a Postgres RAISE EXCEPTION (SQLSTATE P0001) that
+ * Drizzle wraps in its own `Failed query: ...` error, so the actionable
+ * message is reachable only through the `cause` chain.
+ */
+export function acceptanceGuardMessage(error: unknown): string | null {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { message?: unknown; cause?: unknown };
+    if (
+      typeof candidate.message === "string" &&
+      candidate.message.includes(ACCEPTANCE_GUARD_MARKER)
+    ) {
+      return candidate.message;
+    }
+    current = candidate.cause;
+  }
+  return null;
+}

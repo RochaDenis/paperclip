@@ -292,4 +292,26 @@ describe("errorHandler", () => {
       },
     );
   });
+
+  it("maps the aceite_guard trigger rejection to a named 409, not a 500 crash", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const message =
+      "Tarefa STO-1906 mexe no que o usuario ve: precisa do PASSA do Testador de Aceite com print antes de concluir.";
+    const wrapped = new Error(
+      'Failed query: update "issues" set "status" = $1',
+    );
+    (wrapped as { cause?: unknown }).cause = { code: "P0001", message };
+
+    errorHandler(wrapped, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "acceptance_required",
+      code: "acceptance_required",
+      message,
+    });
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
 });

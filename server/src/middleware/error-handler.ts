@@ -13,6 +13,7 @@ import {
   redactSensitiveValueOccurrences,
 } from "./redact-sensitive.js";
 import { recordResponsibleUserDenialOnActiveRun } from "../services/responsible-user-denial-run-outcomes.js";
+import { acceptanceGuardMessage } from "../db-errors.js";
 
 export interface ErrorContext {
   error: {
@@ -232,6 +233,20 @@ export function errorHandler(
     res.status(400).json({
       error: "Validation error",
       details: sanitizeSecretSensitiveResponse(req, zodIssues),
+    });
+    return;
+  }
+
+  // The `aceite_guard` BEFORE UPDATE trigger raises a Postgres RAISE EXCEPTION
+  // when closing user-visible work without a Testador de Aceite "PASSA". That
+  // is a business-rule rejection, not a server crash: surface it as a named
+  // 409 with the trigger's own message instead of a bare 500.
+  const acceptanceGuard = acceptanceGuardMessage(err);
+  if (acceptanceGuard) {
+    res.status(409).json({
+      error: "acceptance_required",
+      code: "acceptance_required",
+      message: acceptanceGuard,
     });
     return;
   }
