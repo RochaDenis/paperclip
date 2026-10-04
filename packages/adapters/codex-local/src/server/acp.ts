@@ -33,13 +33,14 @@ import type {
   AcpxTerminalSessionFailure,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
+  asBoolean,
   asNumber,
   asString,
   asStringArray,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
-import { normalizeCodexModel } from "../index.js";
+import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX, normalizeCodexModel } from "../index.js";
 import { classifyCodexAuthRefreshFailure, extractCodexRetryNotBefore } from "./parse.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
@@ -147,10 +148,25 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
     const match = /^(?:(?:--config=|-c=?)\s*)?sandbox_workspace_write\.network_access\s*=\s*(true|false)\s*$/.exec(arg);
     if (match) networkAccess = match[1] === "true";
   }
+  // Mirrors the CLI lane's default (codex-args.ts): Codex's own per-turn sandbox
+  // preset shells out to a vendored bwrap on Linux to enforce workspace-write,
+  // which fails with "Creating new namespace failed: Permission denied" in
+  // hosts that cannot create unprivileged user namespaces. The ACP lane never
+  // exposed a bypass before, so those hosts broke on the very first tool call
+  // regardless of config.toml (upstream mode presets override it every turn).
+  const explicitSandbox = extraArgs.some((arg) => /^(?:(?:--config=|-c=?)\s*)?(?:sandbox_mode|profile)\s*=/.test(arg));
+  const bypassSandbox = asBoolean(
+    config.dangerouslyBypassApprovalsAndSandbox,
+    asBoolean(config.dangerouslyBypassSandbox, !explicitSandbox && DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX),
+  );
 
   return {
     ...config,
-    env: { ...env, PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: String(networkAccess) },
+    env: {
+      ...env,
+      PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: String(networkAccess),
+      PAPERCLIP_CODEX_ACP_BYPASS_SANDBOX: String(bypassSandbox),
+    },
     agent: "codex",
     mode,
     permissionMode,
