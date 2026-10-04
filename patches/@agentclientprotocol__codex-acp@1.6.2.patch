@@ -1,19 +1,8 @@
-diff --git a/package.json b/package.json
---- a/package.json
-+++ b/package.json
-@@ -65,7 +65,7 @@
-   },
-   "dependencies": {
-     "@agentclientprotocol/sdk": "^1.3.0",
--    "@openai/codex": "^0.148.0",
-+    "@openai/codex": "0.156.0",
-     "diff": "^9.0.0",
-     "open": "^11.0.0",
-     "vscode-jsonrpc": "^9.0.1",
 diff --git a/dist/index.js b/dist/index.js
+index eb58d3e3f2dbe774e1ed5f158cc3c9a4b46f4c5d..77b520d031aa39334a9042756f4963bd2d48c99c 100755
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -25341,7 +25341,7 @@
+@@ -25341,7 +25341,7 @@ var CodexElicitationHandler = class {
    async handleElicitation(params) {
      try {
        const context = this.createMcpElicitationContext(params);
@@ -22,7 +11,7 @@ diff --git a/dist/index.js b/dist/index.js
          const response2 = await this.connection.request(
            methods.client.elicitation.create,
            this.buildElicitationRequest(params, context),
-@@ -25563,7 +25563,7 @@
+@@ -25563,9 +25563,9 @@ var CodexElicitationHandler = class {
              toolCall: {
                toolCallId: context.correlatedCallId,
                kind: "execute",
@@ -32,7 +21,11 @@ diff --git a/dist/index.js b/dist/index.js
                // content: [messageContent],   — omitted: already rendered via item/started
 -              // rawInput: { ... }            — omitted: same reason
              },
-@@ -26988,4 +26988,18 @@
+             _meta: { is_mcp_tool_approval: true },
+             options
+@@ -26986,6 +26986,27 @@ var DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
+ var SUPPORTED_GATEWAY_PROTOCOLS = {
+   openai: "responses"
  };
 +function paperclipBaseInstructions(request) {
 +  if (process.env.PAPERCLIP_ACPX_ISOLATED_CONTEXT !== "1") return void 0;
@@ -43,15 +36,22 @@ diff --git a/dist/index.js b/dist/index.js
 +  }
 +  return void 0;
 +}
++function paperclipBypassesSandbox() {
++  return process.env.PAPERCLIP_CODEX_ACP_BYPASS_SANDBOX === "true";
++}
 +function paperclipSandboxPolicy(sandboxPolicy) {
++  if (paperclipBypassesSandbox()) return { type: "dangerFullAccess" };
 +  const networkAccess = process.env.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS;
 +  if (sandboxPolicy.type !== "workspaceWrite" || !["true", "false"].includes(networkAccess)) return sandboxPolicy;
 +  return { ...sandboxPolicy, networkAccess: networkAccess === "true" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled" };
 +}
++function paperclipApprovalPolicy(approvalPolicy) {
++  return paperclipBypassesSandbox() ? "never" : approvalPolicy;
++}
  var CodexAcpClient = class {
    codexClient;
    config;
-@@ -27288,6 +27297,7 @@
+@@ -27288,6 +27309,7 @@ var CodexAcpClient = class {
      const response = await this.codexClient.threadResume({
        config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),
        cwd: request.cwd,
@@ -59,7 +59,7 @@ diff --git a/dist/index.js b/dist/index.js
        modelProvider: await this.getResumeModelProvider(),
        threadId: request.sessionId
      });
-@@ -27310,6 +27320,7 @@
+@@ -27310,6 +27332,7 @@ var CodexAcpClient = class {
      const response = await this.codexClient.threadResume({
        config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),
        cwd: request.cwd,
@@ -67,14 +67,16 @@ diff --git a/dist/index.js b/dist/index.js
        modelProvider: await this.getResumeModelProvider(),
        threadId: request.sessionId
      });
-@@ -27337,5 +27348,6 @@
+@@ -27337,6 +27360,7 @@ var CodexAcpClient = class {
      const response = await this.codexClient.threadStart({
        config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),
        modelProvider: this.getModelProvider(),
 +      baseInstructions: paperclipBaseInstructions(request),
        cwd: request.cwd
      });
-@@ -27437,5 +27449,12 @@
+     const codexModels = await this.fetchAvailableModels();
+@@ -27436,6 +27460,13 @@ var CodexAcpClient = class {
+     });
      const mergedConfig = {
        ...mergeGatewayConfig(this.config, this.gatewayConfig),
 +      ...(process.env.PAPERCLIP_ACPX_ISOLATED_CONTEXT === "1" ? {
@@ -87,7 +89,7 @@ diff --git a/dist/index.js b/dist/index.js
        projects: Object.fromEntries(sessionRoots.map((root) => [root, {
          trust_level: "trusted"
        }]))
-@@ -27449,7 +27468,7 @@
+@@ -27449,7 +27480,7 @@ var CodexAcpClient = class {
        server: mcp
      }));
      let serversToConfigure = requestedServers;
@@ -96,8 +98,7 @@ diff --git a/dist/index.js b/dist/index.js
        const existingNames = await this.getConfigMcpServerNames(projectPath);
        serversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name));
      }
-@@ -27483,14 +27502,15 @@
-   async refreshSkills(cwd, additionalRoots) {
+@@ -27484,13 +27515,14 @@ var CodexAcpClient = class {
      if (!cwd) {
        return;
      }
@@ -114,16 +115,18 @@ diff --git a/dist/index.js b/dist/index.js
        forceReload: true
      });
    }
-@@ -27600,7 +27624,7 @@
+@@ -27598,8 +27630,8 @@ var CodexAcpClient = class {
+     return await this.codexClient.runTurn({
        threadId: request.sessionId,
        input,
-       approvalPolicy: agentMode.approvalPolicy,
+-      approvalPolicy: agentMode.approvalPolicy,
 -      sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
++      approvalPolicy: paperclipApprovalPolicy(agentMode.approvalPolicy),
 +      sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(paperclipSandboxPolicy(agentMode.sandboxPolicy), additionalDirectories),
        summary: disableSummary ? "none" : "auto",
        effort,
        model: modelId.model,
-@@ -30595,6 +30614,9 @@
+@@ -30613,6 +30645,9 @@ var CodexAcpServer = class _CodexAcpServer {
                updatedGoal
              );
            }
@@ -133,3 +136,16 @@ diff --git a/dist/index.js b/dist/index.js
          } else if (methodRequest.params.action === "pause") {
            const goal = await this.runWithProcessCheck(() => this.codexAcpClient.setGoalStatus(sessionState.sessionId, "paused"));
            if (this.goalPublishIsCurrent(sessionState, sessionGeneration)) {
+diff --git a/package.json b/package.json
+index f1c17b0671f927430cb0c3faded6ed71149270bb..a5ede489a376613e4eae0484bd9329ad6c9ec264 100644
+--- a/package.json
++++ b/package.json
+@@ -65,7 +65,7 @@
+   },
+   "dependencies": {
+     "@agentclientprotocol/sdk": "^1.3.0",
+-    "@openai/codex": "^0.148.0",
++    "@openai/codex": "0.156.0",
+     "diff": "^9.0.0",
+     "open": "^11.0.0",
+     "vscode-jsonrpc": "^9.0.1",
