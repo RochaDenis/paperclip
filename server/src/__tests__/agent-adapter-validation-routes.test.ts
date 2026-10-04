@@ -375,7 +375,7 @@ describe("agent routes adapter validation", () => {
     expect(res.body.adapterType).toBe("external_test");
   });
 
-  it("does not inject CODEX_HOME or OPENAI_API_KEY when creating a keyless codex_local agent", async () => {
+  it("isolates CODEX_HOME but not OPENAI_API_KEY when creating a keyless codex_local agent", async () => {
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
       request(baseUrl)
@@ -389,13 +389,14 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const createInput = mockAgentService.create.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const agentId = String(createInput.id);
     const adapterConfig = createInput.adapterConfig as Record<string, unknown>;
     const env = (adapterConfig.env as Record<string, unknown> | undefined) ?? {};
     expect(env.OPENAI_API_KEY).toBeUndefined();
-    expect(env.CODEX_HOME).toBeUndefined();
+    expect(String(env.CODEX_HOME)).toContain(`/companies/company-1/agents/${agentId}/codex-home`);
   });
 
-  it("does not re-inject CODEX_HOME or OPENAI_API_KEY when updating a keyless codex_local agent", async () => {
+  it("isolates CODEX_HOME but not OPENAI_API_KEY when updating a keyless codex_local agent", async () => {
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
       request(baseUrl)
@@ -410,7 +411,9 @@ describe("agent routes adapter validation", () => {
     const adapterConfig = patch.adapterConfig as Record<string, unknown>;
     const env = (adapterConfig.env as Record<string, unknown> | undefined) ?? {};
     expect(env.OPENAI_API_KEY).toBeUndefined();
-    expect(env.CODEX_HOME).toBeUndefined();
+    expect(String(env.CODEX_HOME)).toContain(
+      "/companies/company-1/agents/11111111-1111-4111-8111-111111111111/codex-home",
+    );
   });
 
   it("forwards a claude_local→process adapter move that drops the OAuth binding to the service unchanged", async () => {

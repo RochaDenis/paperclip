@@ -2508,12 +2508,17 @@ export function agentRoutes(
     return record?.type === "secret_ref" && typeof record.secretId === "string";
   }
 
-  // codex_local agents inherit whatever Codex login is already on the device
-  // (the host's ~/.codex or $CODEX_HOME) by default, so a fresh agent needs no
-  // env overrides at all. We only carve out an isolated per-agent CODEX_HOME
-  // when the agent sets its own OPENAI_API_KEY, so that key's api-key auth.json
-  // does not collide with the shared company home other agents use for the host
-  // login. Agents without a key share the host credentials.
+  // Every codex_local agent gets its own CODEX_HOME by default, carved out
+  // under the Paperclip-managed company tree. Two or more agents sharing one
+  // CODEX_HOME write to the same session sqlite database concurrently; Codex's
+  // sqlite state runtime does not arbitrate that, and concurrent opens fail
+  // with "failed to initialize sqlite state runtime" (STO-7578). The isolated
+  // home still boots with the shared device/company login: execute-time
+  // seeding (seedManagedCodexHome) symlinks auth.json and copies config.toml
+  // from the shared source into it on first run, so credentials and config
+  // stay effectively shared while each agent's session state does not. An
+  // agent that already has an explicit CODEX_HOME (its own override, or one
+  // injected by an earlier run of this function) keeps it untouched.
   function applyCodexLocalKeyIsolation(
     companyId: string,
     agentId: string,
@@ -2521,9 +2526,7 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
   ): Record<string, unknown> {
     if (adapterType !== "codex_local") return adapterConfig;
-    const existingEnv = asRecord(adapterConfig.env);
-    if (!existingEnv) return adapterConfig;
-    if (!codexLocalEnvKeyConfigured(existingEnv.OPENAI_API_KEY)) return adapterConfig;
+    const existingEnv = asRecord(adapterConfig.env) ?? {};
     if (codexLocalEnvKeyConfigured(existingEnv.CODEX_HOME)) return adapterConfig;
     return {
       ...adapterConfig,
