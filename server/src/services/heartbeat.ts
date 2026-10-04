@@ -355,7 +355,10 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
-import { evaluateCodexLocalStartThrottle } from "./codex-local-start-throttle.js";
+import {
+  evaluateCodexLocalStartThrottle,
+  resolveCodexLocalStartMinIntervalMs,
+} from "./codex-local-start-throttle.js";
 import {
   logActivity,
   publishPluginDomainEvent,
@@ -1304,6 +1307,7 @@ async function waitForCodexLocalStartSlot(): Promise<void> {
     const { waitMs } = evaluateCodexLocalStartThrottle(
       Date.now(),
       codexLocalLastStartAtMs,
+      resolveCodexLocalStartMinIntervalMs(),
     );
     if (waitMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitMs));

@@ -17,6 +17,20 @@ export interface CodexLocalStartThrottleDecision {
   waitMs: number;
 }
 
+// Test-only override: suites that start several codex_local runs (with a
+// mocked adapter, never a real sqlite file) would otherwise pay the real
+// 60s wall-clock gap between starts and blow past their own timeouts. See
+// setup-supertest.ts, which zeroes this out for every server test file.
+let minIntervalOverrideMsForTests: number | null = null;
+
+export function setCodexLocalStartMinIntervalMsForTests(ms: number | null): void {
+  minIntervalOverrideMsForTests = ms;
+}
+
+export function resolveCodexLocalStartMinIntervalMs(): number {
+  return minIntervalOverrideMsForTests ?? CODEX_LOCAL_START_MIN_INTERVAL_MS;
+}
+
 /**
  * Pure decision function: given the last recorded start time, how long must
  * the next start wait so starts stay at least `minIntervalMs` apart.

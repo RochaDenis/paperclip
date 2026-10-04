@@ -5,6 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { Server as TlsServer } from "node:tls";
 
+import { setCodexLocalStartMinIntervalMsForTests } from "../services/codex-local-start-throttle.ts";
+
+// STO-7578 item 3's codex_local start throttle defaults to a real 60s gap
+// between process starts. Tests exercise codex_local runs with a mocked
+// adapter (never a real sqlite file), so the real-world gap just makes
+// suites that start several runs blow past their own waitFor/hook timeouts.
+setCodexLocalStartMinIntervalMsForTests(0);
+
 type SupertestServer = NetServer & {
   address(): ReturnType<NetServer["address"]>;
   listen(port: number): NetServer;
