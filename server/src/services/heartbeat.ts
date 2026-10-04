@@ -355,6 +355,7 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
+import { evaluateCodexLocalStartThrottle } from "./codex-local-start-throttle.js";
 import {
   logActivity,
   publishPluginDomainEvent,
@@ -1285,6 +1286,33 @@ const failedProcessRunCancellations = new Map<
 // that must guarantee no run write is still in flight (graceful shutdown, and
 // tests tearing down a shared database) can await drainActiveRunExecutions().
 const activeRunExecutionPromises = new Set<Promise<void>>();
+// STO-7578 item 3: stopgap while codex_local agents share one CODEX_HOME (see
+// codex-local-start-throttle.ts). State is process-wide on purpose — the
+// sqlite contention it guards against is per machine, not per agent or
+// company — and the chain below serializes concurrent callers so only one
+// at a time reads/updates codexLocalLastStartAtMs.
+let codexLocalLastStartAtMs: number | null = null;
+let codexLocalStartGateChain: Promise<void> = Promise.resolve();
+async function waitForCodexLocalStartSlot(): Promise<void> {
+  const previous = codexLocalStartGateChain;
+  let release: () => void = () => {};
+  codexLocalStartGateChain = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    await previous;
+    const { waitMs } = evaluateCodexLocalStartThrottle(
+      Date.now(),
+      codexLocalLastStartAtMs,
+    );
+    if (waitMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    codexLocalLastStartAtMs = Date.now();
+  } finally {
+    release();
+  }
+}
 // Routes dispatch a wakeup fire-and-forget (void heartbeat.wakeup(...)). The
 // wakeup promise stays pending through its asynchronous prologue, and it
 // resolves only after it inserts the queued run and registers the run
@@ -24235,6 +24263,13 @@ export function heartbeatService(
             });
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
+            }
+            // STO-7578 item 3: codex_local processes still sharing one
+            // CODEX_HOME contend on its sqlite state file when several open
+            // at once. Serialize starts to at most one per minute as a
+            // stopgap until per-agent CODEX_HOME isolation is live.
+            if (agent.adapterType === "codex_local") {
+              await waitForCodexLocalStartSlot();
             }
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
