@@ -10,7 +10,10 @@ import {
 // A config copied from another provider can retain unrelated keys.
 const PROVIDER_AUTH_ENV_KEYS: Record<AiProvider, readonly string[]> = {
   anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"],
-  openai: ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME", "OPENAI_BASE_URL"],
+  // CODEX_HOME is excluded: every codex_local agent now gets one by default
+  // for sqlite session isolation (STO-7578), so its presence alone no longer
+  // signals an explicit credential override.
+  openai: ["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"],
   openrouter: ["OPENROUTER_API_KEY", "OPENCODE_AUTH_JSON", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "PAPERCLIP_OPENCODE_PROVIDERS"],
   xai: ["XAI_API_KEY", "GROK_API_KEY", "GROK_HOME", "XAI_BASE_URL"],
 };

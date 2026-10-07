@@ -483,6 +483,23 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it("defaults the ACP lane to bypassing Codex's own per-turn sandbox, mirroring the CLI lane", () => {
+    expect(buildCodexAcpConfig({})).toMatchObject({
+      env: { PAPERCLIP_CODEX_ACP_BYPASS_SANDBOX: "true" },
+    });
+  });
+
+  it.each([
+    { dangerouslyBypassApprovalsAndSandbox: false },
+    { dangerouslyBypassSandbox: false },
+    { extraArgs: ["-c", 'sandbox_mode="workspace-write"'] },
+    { extraArgs: ["--config=profile=readonly"] },
+  ])("honors an explicit sandbox override %j for the ACP lane", (config) => {
+    expect(buildCodexAcpConfig(config)).toMatchObject({
+      env: { PAPERCLIP_CODEX_ACP_BYPASS_SANDBOX: "false" },
+    });
+  });
+
   it("maps Codex config to the ACPX Codex target", () => {
     expect(buildCodexAcpConfig({
       engine: "acp",

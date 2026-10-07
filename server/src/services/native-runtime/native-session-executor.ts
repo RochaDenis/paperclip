@@ -9171,7 +9171,7 @@ const REMOTE_PROVIDER_PACK_PROFILE_DIGESTS = {
   claude:
     "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
   codex:
-    "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
+    "sha256:28782bdd7b3db7846f7729f1f20cc134ba8123de13d5f39cb60fd78b5fc3ef75",
 } as const;
 const REMOTE_PROVIDER_PACK_ARTIFACT_PATHS = {
   nodeCommand: "node_modules/node/bin/node",
