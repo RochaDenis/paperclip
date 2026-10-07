@@ -70,6 +70,24 @@ describe("server image init", () => {
     ).toContain("tini");
   });
 
+  it("installs procps in the base stage so ps/pgrep/pkill exist for pid-exhaustion triage", () => {
+    // node:24-trixie-slim and ubuntu:22.04 ship no process-inspection tools: a
+    // `docker exec` into a container approaching pids.max cannot run `ps` or
+    // `pgrep` to find which process group to kill, so the only diagnosis left
+    // is reading /proc by hand. procps is the standard fix.
+    expect(
+      aptPackages(dockerfile, "base"),
+      "the base stage must apt-get install procps so ps/pgrep/pkill exist in the image",
+    ).toContain("procps");
+  });
+
+  it("installs procps in the agent-runtime base stage for the same reason", () => {
+    expect(
+      aptPackages(agentRuntimeBase, "base"),
+      "the agent-runtime base stage must apt-get install procps so ps/pgrep/pkill exist in the image",
+    ).toContain("procps");
+  });
+
   it("makes tini PID 1 ahead of the entrypoint", () => {
     const lines = entrypoints(dockerfile);
     expect(lines.length, "Dockerfile must declare an ENTRYPOINT").toBeGreaterThan(0);

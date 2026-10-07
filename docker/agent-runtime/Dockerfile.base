@@ -25,8 +25,7 @@ ARG NODE_VERSION
 # fail ("Transport error ... BurntSushi/ripgrep/releases/..."), wasting run
 # budget on every agent run. The root repo Dockerfile already ships rg; this
 # restores parity for the agent-runtime image.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git tini gnupg ripgrep \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tini gnupg ripgrep procps \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
