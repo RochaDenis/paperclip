@@ -38,7 +38,7 @@ import { runningProcesses } from "../adapters/index.ts";
 // pre-dispatch credential gate. Supply a non-secret fixture value per agent;
 // never depend on the developer host having a Codex login.
 const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_input: { runId: string; agent: { id: string } }) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -313,13 +313,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       }
     }));
     const slowResult = slow.dispatchPendingNativeStatusWakeups({ companyId });
+    const callsForAgent = () => mockAdapterExecute.mock.calls.filter(([input]) => input.agent.id === agentId);
     try {
       await paused;
       await db.update(agentWakeupRequests).set({ claimedAt: new Date(0) })
         .where(eq(agentWakeupRequests.id, intent!.id));
       await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
       await heartbeat.drainActiveRunExecutions();
-      const callsBeforeReturn = mockAdapterExecute.mock.calls.length;
+      const callsBeforeReturn = callsForAgent().length;
       release();
       expect(await slowResult).toMatchObject({ dispatched: 0, recovered: 0, claimLost: 1 });
       await slow.drainActiveRunExecutions();
@@ -328,7 +329,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${intent!.id}`),
       ));
       expect(receipts).toHaveLength(1);
-      expect(mockAdapterExecute.mock.calls.length).toBe(callsBeforeReturn);
+      expect(callsForAgent().length).toBe(callsBeforeReturn);
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
       if (agentStatus === "paused") {
         expect(runs).toHaveLength(0);
@@ -338,9 +339,19 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
           payload: { executionWait: { requestedIdempotencyKey: `native-slow:${issueId}` } },
         });
       } else {
-        expect(callsBeforeReturn).toBe(1);
-        expect(runs).toHaveLength(1);
-        expect(runs[0]?.status).toBe("succeeded");
+        const nativeRuns = runs.filter(run => run.wakeupRequestId === receipts[0]!.id);
+        expect(nativeRuns).toHaveLength(1);
+        expect(nativeRuns[0]?.status).toBe("succeeded");
+        // A mock success leaves this issue blocked without a durable next step.
+        // The existing handoff gate correctly creates a separate continuation;
+        // it must not be confused with another delivery of the native intent.
+        for (const run of runs.filter(run => run.id !== nativeRuns[0]!.id)) {
+          expect(run.contextSnapshot).toMatchObject({
+            wakeReason: "finish_successful_run_handoff", parentRunId: nativeRuns[0]!.id,
+          });
+        }
+        expect(callsForAgent().map(([input]) => input.runId).sort())
+          .toEqual(runs.map(run => run.id).sort());
       }
     } finally {
       release();
