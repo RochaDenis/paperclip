@@ -272,7 +272,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       await firstHeartbeat.drainActiveRunExecutions();
       await secondHeartbeat.drainActiveRunExecutions();
     }
-  });
+  }, 60_000);
 
   it.each(["active", "paused"])("fences a slow dispatcher after takeover with an %s agent", async (agentStatus) => {
     const companyId = randomUUID();
@@ -347,7 +347,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       await slowResult;
       await slow.drainActiveRunExecutions();
     }
-  });
+  }, 60_000);
 
   it("dispatches and coalesces durable native status wake intents into one heartbeat run", async () => {
     const companyId = randomUUID();

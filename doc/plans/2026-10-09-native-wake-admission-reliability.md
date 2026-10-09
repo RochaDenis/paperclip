@@ -86,6 +86,10 @@ regression. Production baseline remains a separate requirement.
 Stop promotion on any pause/auth violation or duplicate effect. Investigate a
 completion drop over five percentage points or p95 latency growth over 20%.
 The existing authorized release operator owns escalation and any release.
+Do not treat a mixed-version fleet as fenced: older dispatchers do not honor
+the new intent lock and lease predicates. A future operator must drain the old
+consumers through the existing approved operational path before resuming scans
+on the new version. This PR does not perform that operation.
 Rollback reverts code while preserving receipts, checkpoints and retry lineage.
 Do not reset attempts or repeat unknown external effects. No merge or deployment
 is part of this work.
