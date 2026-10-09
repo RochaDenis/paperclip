@@ -342,7 +342,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         const nativeRuns = runs.filter(run => run.wakeupRequestId === receipts[0]!.id);
         expect(nativeRuns).toHaveLength(1);
         expect(nativeRuns[0]?.status).toBe("succeeded");
-        // A mock success leaves this issue blocked without a durable next step.
+        // The mock reports success without a durable final disposition.
         // The existing handoff gate correctly creates a separate continuation;
         // it must not be confused with another delivery of the native intent.
         for (const run of runs.filter(run => run.id !== nativeRuns[0]!.id)) {
