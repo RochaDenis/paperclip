@@ -567,3 +567,46 @@ describe("parseClaudeStreamJson usage extraction", () => {
     expect(parsed.usageBasis).toBe("per_run");
   });
 });
+
+
+describe("Claude task notification results", () => {
+  const notification = {
+    type: "result", subtype: "success", origin: { kind: "task-notification" },
+    num_turns: 0, result: "", session_id: "notification-session",
+  };
+  const progress = {
+    type: "assistant", session_id: "main-session",
+    message: { content: [{ type: "text", text: "Still working" }] },
+  };
+  const stream = (...events: unknown[]) => events.map(event => JSON.stringify(event)).join("\n");
+
+  it("does not arm terminal cleanup for a notification followed by progress", () => {
+    const parsed = parseClaudeStreamJson(stream(notification, progress));
+    expect(parsed.resultJson).toBeNull();
+    expect(parsed.summary).toBe("Still working");
+    expect(parsed.sessionId).toBe("main-session");
+    expect(parsed.usage).toBeNull();
+    expect(parsed.costUsd).toBeNull();
+  });
+
+  it.each(["success", "error_max_turns"])("preserves genuine %s results around notifications", subtype => {
+    const terminal = {
+      type: "result", subtype, result: "Final result", session_id: "main-session",
+      total_cost_usd: 1, usage: { input_tokens: 10, output_tokens: 20 },
+    };
+    for (const events of [[notification, progress, terminal], [terminal, notification]]) {
+      const parsed = parseClaudeStreamJson(stream(...events));
+      expect(parsed.resultJson).toEqual(terminal);
+      expect(parsed.summary).toBe("Final result");
+      expect(parsed.sessionId).toBe("main-session");
+      expect(parsed.costUsd).toBe(1);
+    }
+  });
+
+  it("keeps empty and zero-turn genuine results terminal", () => {
+    for (const origin of [undefined, null, { kind: "user" }]) {
+      const terminal = { type: "result", subtype: "success", result: "", num_turns: 0, origin };
+      expect(parseClaudeStreamJson(stream(terminal)).resultJson).toEqual(terminal);
+    }
+  });
+});
