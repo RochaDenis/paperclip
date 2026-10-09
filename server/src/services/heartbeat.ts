@@ -18,6 +18,7 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
+import { claimableWakeRequest, observedWakeClaim, lockNativeWakeAdmission, type WakeClaimSnapshot } from "./wakeup-request-claim.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
@@ -26089,7 +26090,7 @@ export function heartbeatService(
     }
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, nativeWakeClaim?: WakeClaimSnapshot) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -26126,10 +26127,14 @@ export function heartbeatService(
     });
     let issueId =
       readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    if (nativeWakeClaim && (!issueId || nativeWakeClaim.agentId !== agentId ||
+        opts.requestedByActorType !== "system" ||
+        opts.requestedByActorId !== `native-status-wake-dispatch:${nativeWakeClaim.id}`)) return null;
     if (executionReconciliationWake && !issueId) return null;
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    if (nativeWakeClaim && nativeWakeClaim.companyId !== agent.companyId) return null;
     if (issueId) {
       const conversation = await getIssueExecutionContext(agent.companyId, issueId);
       if (isConversation(conversation)) {
@@ -26251,6 +26256,7 @@ export function heartbeatService(
     // retain distinct durable receipts even when the same gate blocks them.
     const coalesceExecutionWait =
       opts.requestedByActorType === "system" &&
+      !nativeWakeClaim &&
       !durableRequest &&
       !wakeCommentId &&
       queuedCommentIdsFromRunContext(enrichedContextSnapshot).length === 0 &&
@@ -26290,6 +26296,21 @@ export function heartbeatService(
         finishedAt: new Date(),
         ...patch,
       };
+      if (nativeWakeClaim && issueId) {
+        const nativeIssueId = issueId;
+        return db.transaction(async (tx) => {
+          await tx.execute(sql`select id from issues where id = ${nativeIssueId} and company_id = ${agent.companyId} for update`);
+          const admission = await lockNativeWakeAdmission(tx as unknown as Db, nativeWakeClaim, nativeIssueId);
+          if (admission.kind !== "claimed") return { created: false };
+          // A committed outbox intent needs its own exact receipt even when a
+          // gate stops it. This is not a new provider attempt or a gate bypass.
+          if (waitCondition) return recordExecutionWait(tx as unknown as Db, {
+            issueId: nativeIssueId, request, condition: waitCondition, coalesce: false,
+          });
+          await tx.insert(agentWakeupRequests).values(request);
+          return { created: true };
+        });
+      }
       if (waitCondition && issueId && isUuidLike(issueId)) {
         const waitIssueId = issueId;
         return db.transaction(async (tx) => {
@@ -26635,6 +26656,12 @@ export function heartbeatService(
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+
+          if (nativeWakeClaim) {
+            const admission = await lockNativeWakeAdmission(tx as unknown as Db, nativeWakeClaim, issueId);
+            if (admission.kind === "lost") return { kind: "deferred" as const };
+            if (admission.kind === "recorded") return { kind: "durable" as const, receipt: admission.receipt };
+          }
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -28270,8 +28297,7 @@ export function heartbeatService(
             : undefined,
           eq(agentWakeupRequests.requestedByActorType, "system"),
           eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
-          inArray(agentWakeupRequests.status, ["queued", "claimed"]),
-          isNull(agentWakeupRequests.runId),
+          claimableWakeRequest(now, staleClaimMs),
         ),
       )
       .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -28280,6 +28306,7 @@ export function heartbeatService(
     let dispatched = 0;
     let recovered = 0;
     let deferred = 0;
+    let claimLost = 0;
     const deliveredByIssueScope = new Map<
       string,
       { runId: string | null; status: string }
@@ -28307,7 +28334,7 @@ export function heartbeatService(
           : existingDispatch.status === "deferred_issue_execution"
             ? "coalesced"
             : existingDispatch.status;
-        await db
+        const updated = await db
           .update(agentWakeupRequests)
           .set({
             status: recoveredStatus,
@@ -28319,13 +28346,9 @@ export function heartbeatService(
             error: existingDispatch.error,
             updatedAt: now,
           })
-          .where(
-            and(
-              eq(agentWakeupRequests.id, candidate.id),
-              isNull(agentWakeupRequests.runId),
-            ),
-          );
-        recovered += 1;
+          .where(observedWakeClaim(candidate)).returning({ id: agentWakeupRequests.id });
+        if (updated.length === 0) claimLost += 1;
+        else recovered += 1;
         continue;
       }
 
@@ -28338,25 +28361,19 @@ export function heartbeatService(
         continue;
       }
 
+      const claimTime = new Date();
+      const ownedClaim = { ...candidate, status: "claimed", claimedAt: claimTime };
       const claimed = await db
         .update(agentWakeupRequests)
         .set({
           status: "claimed",
-          claimedAt: now,
+          claimedAt: claimTime,
           error: null,
           updatedAt: now,
         })
-        .where(
-          and(
-            eq(agentWakeupRequests.id, candidate.id),
-            isNull(agentWakeupRequests.runId),
-            candidate.status === "claimed"
-              ? eq(agentWakeupRequests.status, "claimed")
-              : eq(agentWakeupRequests.status, "queued"),
-          ),
-        )
+        .where(observedWakeClaim(candidate))
         .returning({ id: agentWakeupRequests.id });
-      if (claimed.length === 0) continue;
+      if (claimed.length === 0) { claimLost += 1; continue; }
 
       const payload = parseObject(candidate.payload);
       const wakeContext = parseObject(payload._paperclipWakeContext);
@@ -28365,6 +28382,15 @@ export function heartbeatService(
         readNonEmptyString(payload.taskId) ??
         readNonEmptyString(wakeContext.issueId) ??
         null;
+      if (!issueId || payload.issueId !== issueId) {
+        const updated = await db.update(agentWakeupRequests).set({
+          status: "skipped", finishedAt: new Date(), updatedAt: new Date(),
+          error: "Native status wake intent has no canonical issue target",
+        }).where(observedWakeClaim(ownedClaim)).returning({ id: agentWakeupRequests.id });
+        if (updated.length === 0) claimLost += 1;
+        else recovered += 1;
+        continue;
+      }
       const scopeKey = issueId
         ? `${candidate.companyId}:${candidate.agentId}:${issueId}:${readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? ""}`
         : null;
@@ -28372,7 +28398,7 @@ export function heartbeatService(
         ? deliveredByIssueScope.get(scopeKey)
         : null;
       if (priorDelivery) {
-        await db
+        const updated = await db
           .update(agentWakeupRequests)
           .set({
             status: "coalesced",
@@ -28381,8 +28407,9 @@ export function heartbeatService(
             error: null,
             updatedAt: new Date(),
           })
-          .where(eq(agentWakeupRequests.id, candidate.id));
-        recovered += 1;
+          .where(observedWakeClaim(ownedClaim)).returning({ id: agentWakeupRequests.id });
+        if (updated.length === 0) claimLost += 1;
+        else recovered += 1;
         continue;
       }
 
@@ -28413,7 +28440,7 @@ export function heartbeatService(
           (targetIssue.assigneeAgentId !== candidate.agentId && !nativeReview) ||
           (candidate.reason === "native_completion_review" && !nativeReview)
         ) {
-          await db
+          const updated = await db
             .update(agentWakeupRequests)
             .set({
               status: "skipped",
@@ -28425,8 +28452,9 @@ export function heartbeatService(
                   : "Native status wake target has a different assignee",
               updatedAt: new Date(),
             })
-            .where(eq(agentWakeupRequests.id, candidate.id));
-          recovered += 1;
+            .where(observedWakeClaim(ownedClaim)).returning({ id: agentWakeupRequests.id });
+          if (updated.length === 0) claimLost += 1;
+          else recovered += 1;
           continue;
         }
       }
@@ -28449,7 +28477,7 @@ export function heartbeatService(
             statusDecisionSource: "native_status_decision",
             nativeStatusWakeIntentId: candidate.id,
           },
-        });
+        }, undefined, ownedClaim);
 
         const delivered = await db
           .select()
@@ -28471,7 +28499,7 @@ export function heartbeatService(
         // promote both rows (the original has no nativeStatusWakeIntentId
         // provenance and would otherwise run once before the dispatch receipt).
         const deliveredStatus = delivered?.status ?? "queued";
-        await db
+        const updated = await db
           .update(agentWakeupRequests)
           .set({
             status: wakeRun || deliveredStatus === "deferred_issue_execution"
@@ -28485,7 +28513,8 @@ export function heartbeatService(
             error: delivered?.error ?? null,
             updatedAt: new Date(),
           })
-          .where(eq(agentWakeupRequests.id, candidate.id));
+          .where(observedWakeClaim(ownedClaim)).returning({ id: agentWakeupRequests.id });
+        if (updated.length === 0) { claimLost += 1; continue; }
 
         if (scopeKey) {
           deliveredByIssueScope.set(scopeKey, {
@@ -28497,7 +28526,7 @@ export function heartbeatService(
         if (wakeRun) dispatched += 1;
         else deferred += 1;
       } catch (error) {
-        await db
+        const updated = await db
           .update(agentWakeupRequests)
           .set({
             status: "queued",
@@ -28508,13 +28537,8 @@ export function heartbeatService(
                 : String(error).slice(0, 1_000),
             updatedAt: new Date(),
           })
-          .where(
-            and(
-              eq(agentWakeupRequests.id, candidate.id),
-              eq(agentWakeupRequests.status, "claimed"),
-              isNull(agentWakeupRequests.runId),
-            ),
-          );
+          .where(observedWakeClaim(ownedClaim)).returning({ id: agentWakeupRequests.id });
+        if (updated.length === 0) { claimLost += 1; continue; }
         logger.warn(
           {
             err: error,
@@ -28527,7 +28551,7 @@ export function heartbeatService(
       }
     }
 
-    return { scanned: candidates.length, dispatched, recovered, deferred };
+    return { scanned: candidates.length, dispatched, recovered, deferred, claimLost };
   }
 
   async function listProjectScopedRunIds(companyId: string, projectId: string) {

@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -31,8 +34,11 @@ import {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
+// These scheduling tests mock provider execution, but retain the real
+// pre-dispatch credential gate. Supply a non-secret fixture value per agent;
+// never depend on the developer host having a Codex login.
 const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_input: { runId: string; agent: { id: string } }) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -51,6 +57,20 @@ vi.mock("../adapters/index.ts", async () => {
       supportsLocalAgentJwt: false,
       execute: mockAdapterExecute,
     })),
+  };
+});
+
+// Skill catalog import is unrelated to admission and can outlive a test's
+// database cleanup. Keep all scheduling/auth gates real and only stub the
+// provider's empty skill inventory, like the provider execution above.
+vi.mock("../services/company-skills.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/company-skills.js")>("../services/company-skills.js");
+  return {
+    ...actual,
+    companySkillService: (...args: Parameters<typeof actual.companySkillService>) => ({
+      ...actual.companySkillService(...args),
+      listRuntimeSkillEntries: async () => [],
+    }),
   };
 });
 
@@ -88,17 +108,41 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
   return fn();
 }
 
+// The wrapper delays completed database reads, not the SQL mutations under test.
+function interceptSelectRows(db: ReturnType<typeof createDb>, inspect: (rows: any[]) => Promise<void>) {
+  function wrap(query: any): any {
+    return new Proxy(query, {
+      get(target, property) {
+        if (property === "then") return (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) =>
+          target.then(async (rows: any[]) => { await inspect(rows); return rows; }).then(resolve, reject);
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? (...args: unknown[]) => wrap(value.apply(target, args)) : value;
+      },
+    });
+  }
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === "select") return (...args: unknown[]) => wrap((target.select as any)(...args));
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let testHome: string;
 
   beforeAll(async () => {
+    testHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-dependency-test-home-"));
+    vi.stubEnv("PAPERCLIP_HOME", testHome);
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-dependency-scheduling-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     let idlePolls = 0;
@@ -168,7 +212,153 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    vi.unstubAllEnvs();
+    if (testHome) await fs.rm(testHome, { recursive: true, force: true });
   });
+
+  it("admits an expired native wake claim once across two sweep instances", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Claim race", issuePrefix: `C${companyId.slice(0, 6)}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Claim runner", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } }, permissions: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+    });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Expired wake", status: "blocked",
+      assigneeAgentId: agentId, responsibleUserId: "responsible-user",
+    });
+    const [intent] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_children_completed", status: "claimed", claimedAt: new Date(0),
+      payload: { issueId, _paperclipWakeContext: { issueId } },
+      requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-claim-race:${issueId}`,
+    }).returning();
+
+    // Hold both real database snapshots before either service can claim. This
+    // makes the stale-read race deterministic instead of relying on timing.
+    let snapshots = 0;
+    let release!: () => void;
+    const bothRead = new Promise<void>((resolve) => { release = resolve; });
+    const gatedDb = interceptSelectRows(db, async (rows) => {
+      if (snapshots < 2 && rows.length === 1 && rows[0]?.id === intent!.id &&
+          rows[0]?.requestedByActorId === "native-status-committer" && rows[0]?.status === "claimed") {
+        snapshots += 1;
+        if (snapshots === 2) release();
+        await bothRead;
+      }
+    });
+    const secondHeartbeat = heartbeatService(gatedDb);
+    const firstHeartbeat = heartbeatService(gatedDb);
+    try {
+      await Promise.all([
+        firstHeartbeat.dispatchPendingNativeStatusWakeups({ companyId }),
+        secondHeartbeat.dispatchPendingNativeStatusWakeups({ companyId }),
+      ]);
+      const receipts = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${intent!.id}`),
+      ));
+      expect(snapshots).toBe(2);
+      expect(receipts).toHaveLength(1);
+    } finally {
+      release();
+      await firstHeartbeat.drainActiveRunExecutions();
+      await secondHeartbeat.drainActiveRunExecutions();
+    }
+  }, 60_000);
+
+  it.each(["active", "paused"])("fences a slow dispatcher after takeover with an %s agent", async (agentStatus) => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Slow dispatcher", issuePrefix: `S${companyId.slice(0, 6)}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Slow claim runner", role: "engineer", status: agentStatus,
+      adapterType: "codex_local", adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
+      permissions: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+    });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Slow native wake", status: "blocked",
+      assigneeAgentId: agentId, responsibleUserId: "responsible-user",
+    });
+    const [intent] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_children_completed", status: "queued", payload: { issueId },
+      requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-slow:${issueId}`,
+    }).returning();
+    let notifyPaused!: () => void;
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { notifyPaused = resolve; });
+    const continueWorker = new Promise<void>(resolve => { release = resolve; });
+    let held = false;
+    const slow = heartbeatService(interceptSelectRows(db, async rows => {
+      // This read occurs after the dispatcher owns its claim and before it
+      // calls enqueueWakeup. Let its successor finish before it continues.
+      if (!held && rows.length === 1 && rows[0]?.assigneeAgentId === agentId &&
+          rows[0]?.status === "blocked" && !("id" in rows[0])) {
+        held = true;
+        notifyPaused();
+        await continueWorker;
+      }
+    }));
+    const slowResult = slow.dispatchPendingNativeStatusWakeups({ companyId });
+    const callsForAgent = () => mockAdapterExecute.mock.calls.filter(([input]) => input.agent.id === agentId);
+    try {
+      await paused;
+      await db.update(agentWakeupRequests).set({ claimedAt: new Date(0) })
+        .where(eq(agentWakeupRequests.id, intent!.id));
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      await heartbeat.drainActiveRunExecutions();
+      const callsBeforeReturn = callsForAgent().length;
+      release();
+      expect(await slowResult).toMatchObject({ dispatched: 0, recovered: 0, claimLost: 1 });
+      await slow.drainActiveRunExecutions();
+      const receipts = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${intent!.id}`),
+      ));
+      expect(receipts).toHaveLength(1);
+      expect(callsForAgent().length).toBe(callsBeforeReturn);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      if (agentStatus === "paused") {
+        expect(runs).toHaveLength(0);
+        expect(callsBeforeReturn).toBe(0);
+        expect(receipts[0]).toMatchObject({
+          status: "skipped", reason: "agent.not_invokable",
+          payload: { executionWait: { requestedIdempotencyKey: `native-slow:${issueId}` } },
+        });
+      } else {
+        const nativeRuns = runs.filter(run => run.wakeupRequestId === receipts[0]!.id);
+        expect(nativeRuns).toHaveLength(1);
+        expect(nativeRuns[0]?.status).toBe("succeeded");
+        // The mock reports success without a durable final disposition.
+        // The existing handoff gate correctly creates a separate continuation;
+        // it must not be confused with another delivery of the native intent.
+        for (const run of runs.filter(run => run.id !== nativeRuns[0]!.id)) {
+          expect(run.contextSnapshot).toMatchObject({
+            wakeReason: "finish_successful_run_handoff", parentRunId: nativeRuns[0]!.id,
+          });
+        }
+        expect(callsForAgent().map(([input]) => input.runId).sort())
+          .toEqual(runs.map(run => run.id).sort());
+      }
+    } finally {
+      release();
+      await slowResult;
+      await slow.drainActiveRunExecutions();
+    }
+  }, 60_000);
 
   it("dispatches and coalesces durable native status wake intents into one heartbeat run", async () => {
     const companyId = randomUUID();
@@ -188,7 +378,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
       permissions: {},
     });
@@ -286,7 +476,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
       permissions: {},
     });
@@ -382,7 +572,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -637,7 +827,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -770,7 +960,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -907,7 +1097,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "qa",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -1107,7 +1297,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -1239,7 +1429,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       role: "engineer",
       status: "active",
       adapterType: "codex_local",
-      adapterConfig: {},
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-not-a-provider-key" } },
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
