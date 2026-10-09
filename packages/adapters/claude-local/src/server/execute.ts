@@ -62,6 +62,7 @@ import {
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
+  isClaudeTaskNotificationResult,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -979,7 +980,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
-    const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
+    const fallback = parsedStream.resultJson ? null : parseJson(proc.stdout);
+    const parsed = parsedStream.resultJson ?? (isClaudeTaskNotificationResult(fallback) ? null : fallback);
     return { proc, parsedStream, parsed };
   };
 

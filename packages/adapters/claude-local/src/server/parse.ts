@@ -54,6 +54,10 @@ export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null
   return { inputTokens, outputTokens, cachedInputTokens };
 }
 
+export function isClaudeTaskNotificationResult(event: Record<string, unknown> | null): boolean {
+  return event?.type === "result" && asString(parseObject(event.origin).kind, "") === "task-notification";
+}
+
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
   let model = "";
@@ -89,6 +93,9 @@ export function parseClaudeStreamJson(stdout: string) {
     }
 
     if (type === "result") {
+      // Task notifications can emit a result while the main turn is still
+      // running. They must not arm terminal cleanup or replace its final result.
+      if (isClaudeTaskNotificationResult(event)) continue;
       finalResult = event;
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
     }
